@@ -1,0 +1,95 @@
+# vram-proxy config.yaml
+# ========================
+#
+# Each service needs:
+#   name     - human-readable label
+#   type     - plugin type: lmstudio | comfyui | openai
+#   prefix   - URL prefix for this service (optional, default: empty)
+#              Empty prefix means routes are served at their bare paths.
+#              A prefix of "openai" means /v1/chat/completions becomes
+#              /openai/v1/chat/completions, and models are at /openai/v1/models.
+#   baseUrl  - where the service is listening
+#   routes   - URL paths this service handles (without the prefix)
+#
+# Prefix scoping
+# --------------
+# The prefix is stripped before forwarding, so upstreams always receive
+# their native paths regardless of what prefix you configure here.
+#
+# /v1/models is automatically handled per-prefix:
+#   /openai/v1/models   → models from services with prefix: openai
+#   /comfyui/v1/models  → models from services with prefix: comfyui
+#   /v1/models          → models from services with no prefix
+#   /comfyui/models     → also works (shorthand without /v1/)
+#
+# Multiple services can share the same prefix — their models and routes
+# are merged under that namespace.
+
+services:
+
+  # ── LM Studio (LLMs) ───────────────────────────────────────────────────────
+  # Served under /openai/ — e.g. /openai/v1/chat/completions
+  # LM Studio's plugin handles VRAM unload via its own /api/v1/models/unload.
+  - name: LM Studio
+    type: lmstudio
+    prefix: openai
+    baseUrl: http://host.docker.internal:1234
+    routes:
+      - /v1/chat/completions
+      - /v1/completions
+      - /v1/embeddings
+
+  # ── ComfyUI (image generation) ─────────────────────────────────────────────
+  # Served under /comfyui/ — e.g. /comfyui/prompt
+  # Models are declared here (ComfyUI has no OpenAI-format list endpoint).
+  # VRAM freed via POST /free.
+  - name: ComfyUI
+    type: comfyui
+    prefix: comfyui
+    baseUrl: http://host.docker.internal:8188
+    models:
+      - id: stable-diffusion-xl
+        description: SDXL 1.0
+      - id: flux-dev
+        description: Flux.1 dev
+    routes:
+      - /prompt
+      - /queue
+      - /history
+      - /upload
+      - /view
+      - /object_info
+
+  # ── Whisper STT ─────────────────────────────────────────────────────────────
+  # Also under /openai/ — its models appear in /openai/v1/models alongside
+  # LM Studio's.  Container-managed: stopped when not in use to free VRAM,
+  # started on demand when a transcription request arrives.
+  - name: Whisper
+    type: openai
+    prefix: openai
+    baseUrl: http://host.docker.internal:8000
+    container:
+      name: openedai-whisper
+      health_path: /health
+      start_timeout: 60
+      stop_timeout: 15
+      ttl: 300
+    routes:
+      - /v1/audio/transcriptions
+      - /v1/audio/translations
+
+  # ── Kokoro TTS ──────────────────────────────────────────────────────────────
+  # No prefix — served at bare /v1/audio/speech.
+  # Its models appear in the bare /v1/models response.
+  - name: Kokoro TTS
+    type: openai
+    prefix:
+    baseUrl: http://host.docker.internal:8880
+    container:
+      name: kokoro-tts
+      health_path: /health
+      start_timeout: 45
+      stop_timeout: 15
+      ttl: 300
+    routes:
+      - /v1/audio/speech
