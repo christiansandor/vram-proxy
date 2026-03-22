@@ -4,23 +4,35 @@
 # Each service needs:
 #   name     - human-readable label
 #   type     - plugin type: lmstudio | comfyui | openai
-#   prefix   - URL prefix for this service (optional, default: empty)
-#              Empty prefix means routes are served at their bare paths.
-#              A prefix of "openai" means /v1/chat/completions becomes
-#              /openai/v1/chat/completions, and models are at /openai/v1/models.
+#   prefix   - URL namespace under /v1 (optional, default: empty)
+#              Empty prefix:    routes served at /v1/<route>
+#              prefix: openai:  routes served at /v1/openai/<route>
 #   baseUrl  - where the service is listening
-#   routes   - URL paths this service handles (without the prefix)
+#   routes   - Upstream paths exactly as the backing service expects them.
+#              The proxy derives the client-facing URL automatically:
+#                route=/v1/chat/completions + prefix=openai
+#                  → client hits /v1/openai/chat/completions
+#                  → upstream receives /v1/chat/completions
+#                route=/object_info + prefix=comfyui
+#                  → client hits /v1/comfyui/object_info
+#                  → upstream receives /object_info
+#              Services that use /v1 natively keep it in their routes.
+#              Services that don't (e.g. ComfyUI) omit it.
 #
-# Prefix scoping
-# --------------
+# URL structure
+# -------------
+# All traffic is rooted under /v1:
+#
+#   No prefix:    /v1/audio/speech          → upstream: /v1/audio/speech
+#   prefix=openai /v1/openai/chat/completions → upstream: /v1/chat/completions
+#
 # The prefix is stripped before forwarding, so upstreams always receive
-# their native paths regardless of what prefix you configure here.
+# their native /v1/... paths regardless of what prefix you configure here.
 #
-# /v1/models is automatically handled per-prefix:
-#   /openai/v1/models   → models from services with prefix: openai
-#   /comfyui/v1/models  → models from services with prefix: comfyui
-#   /v1/models          → models from services with no prefix
-#   /comfyui/models     → also works (shorthand without /v1/)
+# Model discovery
+# ---------------
+# /v1/models              → models from services with no prefix
+# /v1/<prefix>/models     → models from services with that prefix
 #
 # Multiple services can share the same prefix — their models and routes
 # are merged under that namespace.
@@ -28,7 +40,7 @@
 services:
 
   # ── LM Studio (LLMs) ───────────────────────────────────────────────────────
-  # Served under /openai/ — e.g. /openai/v1/chat/completions
+  # Served under /v1/openai/ — e.g. /v1/openai/chat/completions
   # LM Studio's plugin handles VRAM unload via its own /api/v1/models/unload.
   - name: LM Studio
     type: lmstudio
@@ -40,7 +52,7 @@ services:
       - /v1/embeddings
 
   # ── ComfyUI (image generation) ─────────────────────────────────────────────
-  # Served under /comfyui/ — e.g. /comfyui/prompt
+  # Served under /v1/comfyui/ — e.g. /v1/comfyui/prompt
   # Models are declared here (ComfyUI has no OpenAI-format list endpoint).
   # VRAM freed via POST /free.
   - name: ComfyUI
@@ -61,7 +73,7 @@ services:
       - /object_info
 
   # ── Whisper STT ─────────────────────────────────────────────────────────────
-  # Also under /openai/ — its models appear in /openai/v1/models alongside
+  # Also under /v1/openai/ — its models appear in /v1/openai/models alongside
   # LM Studio's.  Container-managed: stopped when not in use to free VRAM,
   # started on demand when a transcription request arrives.
   - name: Whisper
@@ -79,7 +91,7 @@ services:
       - /v1/audio/translations
 
   # ── Kokoro TTS ──────────────────────────────────────────────────────────────
-  # No prefix — served at bare /v1/audio/speech.
+  # No prefix — served at /v1/audio/speech.
   # Its models appear in the bare /v1/models response.
   - name: Kokoro TTS
     type: openai

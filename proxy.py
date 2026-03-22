@@ -10,8 +10,15 @@ to a target service, every *other* service is unloaded synchronously:
 After unloading others, if the target has a `container:` block it is started
 and health-polled before the request is forwarded.
 
-GET /v1/models aggregates model lists from all services and is never blocked
-by the lock — it always responds immediately.
+All routes are served under /v1:
+  - No prefix:   /v1/<route>               → upstream receives /v1/<route>
+  - With prefix: /v1/<prefix>/<route>      → upstream receives /v1/<route>
+  - Models:      /v1/models                → aggregated (no-prefix services)
+                 /v1/<prefix>/models       → aggregated (prefixed services)
+
+GET /v1/models (and /v1/<prefix>/models) aggregates model lists from all
+matching services and is never blocked by the lock — it always responds
+immediately.
 """
 
 import http.client
@@ -50,16 +57,17 @@ def _print_services(cfg: dict) -> None:
             extra = f"  [container: {c['name']}{ttl_str}]"
         else:
             extra = ''
-        prefix = svc.get('prefix', '')
-        prefix_str = f'/{prefix}' if prefix else '(no prefix)'
+        p = (svc.get('prefix') or '').strip('/')
+        prefix_str = f'/v1/{p}' if p else '/v1'
         print(
             f"  [{svc.get('type', '?')}]  {svc['name']}  →  {svc['baseUrl']}"
             f"  prefix={prefix_str}{extra}",
             flush=True,
         )
         for route in svc.get('routes', []):
-            display = f"/{prefix}{route}" if prefix else route
-            print(f"          {display}", flush=True)
+            route_client = route[3:] if route.startswith('/v1') else route
+            display = f"/v1/{p}{route_client}" if p else f"/v1{route_client}"
+            print(f"          {display}  →  {route}", flush=True)
 
 
 def _start_config_watcher() -> None:
@@ -148,30 +156,25 @@ def _svc_prefix(service: dict) -> str:
 
 def _parse_models_path(path: str) -> tuple[str, bool]:
     """
-    Detect whether `path` is a models endpoint and extract its prefix.
+    Detect whether `path` is a models endpoint under /v1 and extract its
+    prefix.
 
     Recognised patterns:
-      /v1/models          → prefix='',       is_models=True
-      /models             → prefix='',       is_models=True
-      /openai/v1/models   → prefix='openai', is_models=True
-      /comfyui/models     → prefix='comfyui',is_models=True
-      /anything/else      → prefix='',       is_models=False
+      /v1/models              → prefix='',       is_models=True
+      /v1/<prefix>/models     → prefix='prefix', is_models=True
+      anything else           → prefix='',       is_models=False
 
     Returns (prefix, is_models).
     """
-    # Strip leading slash, split into segments
     parts = path.lstrip('/').split('/')
 
-    # /v1/models  or  /models
-    if parts == ['v1', 'models'] or parts == ['models']:
+    # /v1/models
+    if parts == ['v1', 'models']:
         return '', True
 
-    # /<prefix>/v1/models  or  /<prefix>/models
-    if len(parts) >= 2 and parts[-1] == 'models':
-        if len(parts) >= 3 and parts[-2] == 'v1':
-            return parts[0], True   # e.g. ['openai', 'v1', 'models']
-        if len(parts) == 2:
-            return parts[0], True   # e.g. ['comfyui', 'models']
+    # /v1/<prefix>/models
+    if len(parts) == 3 and parts[0] == 'v1' and parts[2] == 'models':
+        return parts[1], True
 
     return '', False
 
@@ -208,8 +211,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # Models endpoint: /<prefix>/v1/models, /<prefix>/models, or
-        # /v1/models / /models for prefix-less services.
+        # Models endpoint: /v1/models or /v1/<prefix>/models — lock-free.
         if self.command == 'GET':
             prefix, is_models = _parse_models_path(base_path)
             if is_models:
@@ -301,8 +303,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        prefix_label = f'/{prefix}' if prefix else ''
-        print(f"✓ {prefix_label}/v1/models → {len(all_models)} model(s)", flush=True)
+        prefix_label = f'/v1/{prefix}' if prefix else '/v1'
+        print(f"✓ {prefix_label}/models → {len(all_models)} model(s)", flush=True)
 
     # ── Routing ──────────────────────────────────────────────────────────────
 
@@ -311,17 +313,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
         Return (service, stripped_path) for the first service whose
         prefix+route matches the request path, or None.
 
-        stripped_path has the service prefix removed so the upstream
-        receives the path it natively expects.
+        Routes in config.yaml are upstream paths — exactly what the backing
+        service expects to receive.  The proxy derives the client-facing URL
+        by placing them under /v1/{prefix}/, stripping any leading /v1 from
+        the route so it isn't doubled in the client URL:
+
+          route=/v1/chat/completions  prefix=openai
+            client: /v1/openai/chat/completions  → upstream: /v1/chat/completions
+
+          route=/object_info          prefix=comfyui
+            client: /v1/comfyui/object_info      → upstream: /object_info
+
+          route=/v1/audio/speech      prefix=(none)
+            client: /v1/audio/speech             → upstream: /v1/audio/speech
         """
         for svc in config.get('services', []):
             p = _svc_prefix(svc)
-            prefix_seg = f'/{p}' if p else ''
+            prefix_seg = f'/v1/{p}' if p else '/v1'
             for route in svc.get('routes', []):
-                full_route = prefix_seg + route
+                # Strip leading /v1 from the route for client-side matching
+                # so routes with /v1 (e.g. LM Studio) don't double it.
+                route_client = route[3:] if route.startswith('/v1') else route
+                full_route = prefix_seg + route_client
                 if path == full_route or path.startswith(full_route + '/') or path.startswith(full_route + '?'):
-                    stripped = path[len(prefix_seg):] if prefix_seg else path
-                    return svc, stripped
+                    # Upstream receives the original route + any path suffix.
+                    suffix = path[len(full_route):]
+                    return svc, route + suffix
         return None
 
     # ── Forwarding ───────────────────────────────────────────────────────────
