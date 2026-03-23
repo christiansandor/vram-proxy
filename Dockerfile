@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY proxy.py .
 COPY docker_manager.py .
+COPY audit.py .
 COPY plugins/ ./plugins/
 
 EXPOSE 8080

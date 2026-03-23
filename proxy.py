@@ -10,15 +10,25 @@ to a target service, every *other* service is unloaded synchronously:
 After unloading others, if the target has a `container:` block it is started
 and health-polled before the request is forwarded.
 
-All routes are served under /v1:
-  - No prefix:   /v1/<route>               → upstream receives /v1/<route>
-  - With prefix: /v1/<prefix>/<route>      → upstream receives /v1/<route>
-  - Models:      /v1/models                → aggregated (no-prefix services)
-                 /v1/<prefix>/models       → aggregated (prefixed services)
+GET /v1/models aggregates model lists from all services and is never blocked
+by the lock — it always responds immediately.
 
-GET /v1/models (and /v1/<prefix>/models) aggregates model lists from all
-matching services and is never blocked by the lock — it always responds
-immediately.
+Auth
+----
+If `auth.token` is set in config.yaml, every request must supply:
+
+    Authorization: Bearer <token>
+
+Requests without a valid token receive HTTP 401.  The following paths are
+always exempt regardless of auth config:
+
+  GET /health          (Docker / load-balancer health checks)
+
+Optionally, model-listing endpoints can also be made exempt:
+
+  auth:
+    token: mysecrettoken
+    public_models: true   # allow /v1/models without a token (default: false)
 """
 
 import http.client
@@ -34,6 +44,7 @@ from urllib.parse import urlparse
 
 import yaml
 
+import audit
 import docker_manager as dm
 
 # ---------------------------------------------------------------------------
@@ -44,6 +55,60 @@ CONFIG_PATH = 'config.yaml'
 
 with open(CONFIG_PATH) as f:
     config = yaml.safe_load(f)
+
+# ---------------------------------------------------------------------------
+# Audit logger  (initialised from config once on startup)
+# ---------------------------------------------------------------------------
+
+def _init_audit() -> None:
+    audit_cfg = config.get('audit', {}) or {}
+    keep_days = int(audit_cfg.get('keep_days', 30))
+    audit.setup(keep_days=keep_days)
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+def _configured_token() -> str | None:
+    """Return the required Bearer token, or None if auth is disabled."""
+    return (config.get('auth') or {}).get('token') or None
+
+
+def _public_models() -> bool:
+    """True if /v1/models endpoints are exempt from auth."""
+    return bool((config.get('auth') or {}).get('public_models', False))
+
+
+def _check_auth(handler: 'ProxyHandler') -> tuple[bool, str]:
+    """
+    Validate the Authorization header against the configured token.
+
+    Returns (passed, auth_label) where auth_label is one of:
+      'ok'     — token present and correct
+      'fail'   — token missing or wrong
+      'exempt' — no token configured, or path is always-exempt
+    """
+    token = _configured_token()
+    if not token:
+        return True, 'exempt'
+
+    authorization = handler.headers.get('Authorization', '')
+    if authorization == f'Bearer {token}':
+        return True, 'ok'
+
+    return False, 'fail'
+
+
+def _send_401(handler: 'ProxyHandler') -> None:
+    body = json.dumps({'error': {'message': 'Unauthorized', 'type': 'auth_error'}}).encode()
+    handler.send_response(401)
+    handler.send_header('Content-Type', 'application/json')
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('WWW-Authenticate', 'Bearer realm="vram-proxy"')
+    handler.end_headers()
+    handler.wfile.write(body)
+
 
 # ---------------------------------------------------------------------------
 # Config watcher
@@ -57,17 +122,16 @@ def _print_services(cfg: dict) -> None:
             extra = f"  [container: {c['name']}{ttl_str}]"
         else:
             extra = ''
-        p = (svc.get('prefix') or '').strip('/')
-        prefix_str = f'/v1/{p}' if p else '/v1'
+        prefix = svc.get('prefix', '')
+        prefix_str = f'/{prefix}' if prefix else '(no prefix)'
         print(
             f"  [{svc.get('type', '?')}]  {svc['name']}  →  {svc['baseUrl']}"
             f"  prefix={prefix_str}{extra}",
             flush=True,
         )
         for route in svc.get('routes', []):
-            route_client = route[3:] if route.startswith('/v1') else route
-            display = f"/v1/{p}{route_client}" if p else f"/v1{route_client}"
-            print(f"          {display}  →  {route}", flush=True)
+            display = f"/{prefix}{route}" if prefix else route
+            print(f"          {display}", flush=True)
 
 
 def _start_config_watcher() -> None:
@@ -156,25 +220,30 @@ def _svc_prefix(service: dict) -> str:
 
 def _parse_models_path(path: str) -> tuple[str, bool]:
     """
-    Detect whether `path` is a models endpoint under /v1 and extract its
-    prefix.
+    Detect whether `path` is a models endpoint and extract its prefix.
 
     Recognised patterns:
-      /v1/models              → prefix='',       is_models=True
-      /v1/<prefix>/models     → prefix='prefix', is_models=True
-      anything else           → prefix='',       is_models=False
+      /v1/models          → prefix='',       is_models=True
+      /models             → prefix='',       is_models=True
+      /openai/v1/models   → prefix='openai', is_models=True
+      /comfyui/models     → prefix='comfyui',is_models=True
+      /anything/else      → prefix='',       is_models=False
 
     Returns (prefix, is_models).
     """
+    # Strip leading slash, split into segments
     parts = path.lstrip('/').split('/')
 
-    # /v1/models
-    if parts == ['v1', 'models']:
+    # /v1/models  or  /models
+    if parts == ['v1', 'models'] or parts == ['models']:
         return '', True
 
-    # /v1/<prefix>/models
-    if len(parts) == 3 and parts[0] == 'v1' and parts[2] == 'models':
-        return parts[1], True
+    # /<prefix>/v1/models  or  /<prefix>/models
+    if len(parts) >= 2 and parts[-1] == 'models':
+        if len(parts) >= 3 and parts[-2] == 'v1':
+            return parts[0], True   # e.g. ['openai', 'v1', 'models']
+        if len(parts) == 2:
+            return parts[0], True   # e.g. ['comfyui', 'models']
 
     return '', False
 
@@ -193,15 +262,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # We print our own logs
 
+    # Track the response status for audit logging.
+    _response_status: int = 0
+
+    def send_response(self, code, message=None):
+        self._response_status = code
+        super().send_response(code, message)
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else '-'
+
     # ── Entry point ─────────────────────────────────────────────────────────
 
     def handle_request(self) -> None:
         self.close_connection = True
+        start_time = time.monotonic()
+        self._response_status = 0
         print(f"→ {self.command} {self.path}", flush=True)
 
         base_path = self.path.split('?')[0].rstrip('/')
 
-        # Health check — always 200, never touches the lock.
+        # ── /health — always exempt, never logged as an AI request ──────────
         if self.command == 'GET' and base_path == '/health':
             body = json.dumps({'status': 'ok'}).encode()
             self.send_response(200)
@@ -209,14 +290,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            # Health checks are very frequent; skip audit log to avoid noise.
             return
 
-        # Models endpoint: /v1/models or /v1/<prefix>/models — lock-free.
-        if self.command == 'GET':
-            prefix, is_models = _parse_models_path(base_path)
-            if is_models:
-                self._serve_models(prefix)
-                return
+        # ── Auth check ───────────────────────────────────────────────────────
+        # Models endpoints can optionally be made public (public_models: true).
+        _, is_models_path = _parse_models_path(base_path)
+        skip_auth = self.command == 'GET' and is_models_path and _public_models()
+
+        if skip_auth:
+            auth_label = 'exempt'
+            auth_ok = True
+        else:
+            auth_ok, auth_label = _check_auth(self)
+
+        if not auth_ok:
+            print(f"  ✗ Auth failed for {self._client_ip()}", flush=True)
+            _send_401(self)
+            audit.record(
+                ip=self._client_ip(),
+                method=self.command,
+                path=self.path,
+                service='-',
+                status=self._response_status,
+                start_time=start_time,
+                auth=auth_label,
+            )
+            return
+
+        # ── Models endpoint: lock-free ────────────────────────────────────────
+        if self.command == 'GET' and is_models_path:
+            prefix, _ = _parse_models_path(base_path)
+            self._serve_models(prefix)
+            audit.record(
+                ip=self._client_ip(),
+                method=self.command,
+                path=self.path,
+                service='<models>',
+                status=self._response_status,
+                start_time=start_time,
+                auth=auth_label,
+            )
+            return
 
         # Read body before acquiring the lock so a slow upload doesn't
         # block other requests from even queuing.
@@ -227,6 +342,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if match is None:
             print(f"✗ No service configured for {self.path}", flush=True)
             self.send_error(404, "No service configured for this route")
+            audit.record(
+                ip=self._client_ip(),
+                method=self.command,
+                path=self.path,
+                service='-',
+                status=404,
+                start_time=start_time,
+                auth=auth_label,
+            )
             return
 
         target, stripped_path = match
@@ -235,6 +359,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _get_plugin(target)  # Validate the plugin exists before queuing
         except RuntimeError as exc:
             self.send_error(500, str(exc))
+            audit.record(
+                ip=self._client_ip(),
+                method=self.command,
+                path=self.path,
+                service=target.get('name', '-'),
+                status=500,
+                start_time=start_time,
+                auth=auth_label,
+            )
             return
 
         print(f"  Waiting for lock...", flush=True)
@@ -249,6 +382,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._forward(target, body, stripped_path)
             dm.touch(target)  # Reset TTL idle timer after request completes
 
+        audit.record(
+            ip=self._client_ip(),
+            method=self.command,
+            path=self.path,
+            service=target.get('name', '-'),
+            status=self._response_status,
+            start_time=start_time,
+            auth=auth_label,
+        )
         print(f"✓ Done {self.command} {self.path}", flush=True)
 
     # ── VRAM management ─────────────────────────────────────────────────────
@@ -303,8 +445,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        prefix_label = f'/v1/{prefix}' if prefix else '/v1'
-        print(f"✓ {prefix_label}/models → {len(all_models)} model(s)", flush=True)
+        prefix_label = f'/{prefix}' if prefix else ''
+        print(f"✓ {prefix_label}/v1/models → {len(all_models)} model(s)", flush=True)
 
     # ── Routing ──────────────────────────────────────────────────────────────
 
@@ -313,32 +455,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         Return (service, stripped_path) for the first service whose
         prefix+route matches the request path, or None.
 
-        Routes in config.yaml are upstream paths — exactly what the backing
-        service expects to receive.  The proxy derives the client-facing URL
-        by placing them under /v1/{prefix}/, stripping any leading /v1 from
-        the route so it isn't doubled in the client URL:
-
-          route=/v1/chat/completions  prefix=openai
-            client: /v1/openai/chat/completions  → upstream: /v1/chat/completions
-
-          route=/object_info          prefix=comfyui
-            client: /v1/comfyui/object_info      → upstream: /object_info
-
-          route=/v1/audio/speech      prefix=(none)
-            client: /v1/audio/speech             → upstream: /v1/audio/speech
+        stripped_path has the service prefix removed so the upstream
+        receives the path it natively expects.
         """
         for svc in config.get('services', []):
             p = _svc_prefix(svc)
-            prefix_seg = f'/v1/{p}' if p else '/v1'
+            prefix_seg = f'/{p}' if p else ''
             for route in svc.get('routes', []):
-                # Strip leading /v1 from the route for client-side matching
-                # so routes with /v1 (e.g. LM Studio) don't double it.
-                route_client = route[3:] if route.startswith('/v1') else route
-                full_route = prefix_seg + route_client
+                full_route = prefix_seg + route
                 if path == full_route or path.startswith(full_route + '/') or path.startswith(full_route + '?'):
-                    # Upstream receives the original route + any path suffix.
-                    suffix = path[len(full_route):]
-                    return svc, route + suffix
+                    stripped = path[len(prefix_seg):] if prefix_seg else path
+                    return svc, stripped
         return None
 
     # ── Forwarding ───────────────────────────────────────────────────────────
@@ -427,7 +554,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def run() -> None:
     print("vram-proxy starting up...\n", flush=True)
 
-    print("Loading plugins:", flush=True)
+    print("Initialising audit logger:", flush=True)
+    _init_audit()
+
+    print("\nLoading plugins:", flush=True)
     _load_plugins()
 
     print("\nStarting config watcher:", flush=True)
@@ -435,6 +565,13 @@ def run() -> None:
 
     print("\nStarting TTL watchdog:", flush=True)
     dm.start_ttl_watchdog(config, _request_lock)
+
+    token = _configured_token()
+    if token:
+        public_models_note = ' (models endpoints are public)' if _public_models() else ''
+        print(f"\nAuth: Bearer token configured{public_models_note}", flush=True)
+    else:
+        print(f"\nAuth: DISABLED — set auth.token in config.yaml to require a token", flush=True)
 
     print("\nConfigured services:", flush=True)
     _print_services(config)

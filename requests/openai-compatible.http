@@ -1,0 +1,5 @@
+### GET Get models
+GET {{url}}/v1/models
+Authorization: Bearer {{token}}
+
+###

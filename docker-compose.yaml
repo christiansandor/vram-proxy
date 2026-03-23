@@ -9,6 +9,8 @@ services:
       - "5234:8080"
     volumes:
       - ./config.yaml:/app/config.yaml
+      # Persist audit logs outside the container so they survive restarts.
+      - ./audit_logs:/app/audit_logs
       # Docker socket mount — required for container start/stop management.
       # If you don't use `container:` blocks in config.yaml, remove this.
       - /var/run/docker.sock:/var/run/docker.sock

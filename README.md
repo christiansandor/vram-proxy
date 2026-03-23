@@ -124,6 +124,46 @@ Every proxied response includes:
 |--------|-------|
 | `X-Vram-Proxy-Service` | Name of the service that handled the request |
 
+## Authorization
+
+Bearer token authentication can be enabled via `config.yaml`:
+
+```yaml
+auth:
+  token: mysecrettoken    # Required Bearer token (omit to disable auth)
+  public_models: false    # Allow /v1/models without token (default: false)
+```
+
+**Behavior:**
+- Requests without a valid token receive HTTP 401 Unauthorized
+- `/health` endpoint is always exempt (for Docker/load-balancer health checks)
+- `/v1/models` endpoints can optionally be made public via `public_models: true`
+- Failed auth attempts are logged with `auth: "fail"` in audit logs
+
+## Audit Logs
+
+Structured JSON audit logging writes one record per request to `audit_logs/audit.log`. Features include:
+
+- **Daily file rotation** with configurable retention period
+- **Recorded fields**:
+  | Field | Description |
+  |-------|-------------|
+  | `ts` | ISO-8601 UTC timestamp |
+  | `ip` | Client IP address |
+  | `method` | HTTP method (GET, POST, …) |
+  | `path` | Raw request path including query string |
+  | `service` | Matched service name or "-" for unrouted/auth-failed requests |
+  | `status` | HTTP status code returned to the client |
+  | `duration_ms` | Wall-clock milliseconds from request start to response sent |
+  | `auth` | Authentication state: "ok", "fail", or "exempt" |
+
+**Configuration:**
+
+```yaml
+audit:
+  keep_days: 30           # How many days to retain rotated log files (default: 30)
+```
+
 ## Notes
 
 - **Docker socket**: the docker-compose.yaml mounts `/var/run/docker.sock` into the container. Remove it if you don't use any `container:` blocks.

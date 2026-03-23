@@ -58,6 +58,7 @@ docker-compose.override.yaml
 .env.local
 .env.*.local
 config.yaml
+*.private.env.json
 
 # OS-specific files
 .DS_Store
